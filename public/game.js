@@ -16,7 +16,6 @@
   MINI.w = () => W - 20;
 
   // ---------- 상태 ----------
-  let ws = null;
   let me = -1;
   let heights = null;
   let tanks = null;
@@ -50,32 +49,62 @@
   const sx = wx => (wx - cam.x) * S;
   const sy = wy => H - (wy - cam.y) * S;
 
-  // ---------- 로비 ----------
+  // ---------- 로비 / 연결 ----------
+  // 세 가지 방식:
+  //  ws      : Node 서버(server.js)로 접속
+  //  room    : claude.ai 아티팩트의 실시간 방. 먼저 온 사람의 기기가 방장(게임 진행)
+  //  hotseat : 한 기기에서 둘이 번갈아
   const params = new URLSearchParams(location.search);
+  const inArtifact = !!(window.claude && typeof window.claude.use === 'function');
+  let net = { send() {} };
+  let hotseat = false;
+  let localGame = null;
+
+  function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+
   function showLobby() {
-    overlay.classList.remove('hidden');
-    card.innerHTML = `
+    showCard(`
       <h1>💥 꼬마 포트리스</h1>
-      <p>두 명이 들어오면 게임이 시작돼요!</p>
-      <input id="nick" maxlength="12" placeholder="이름" value="${escapeHtml(localStorage.getItem('nick') || '')}">
-      <input id="room" maxlength="20" placeholder="방 이름 (같게 맞추기)" value="${escapeHtml(params.get('room') || 'main')}">
-      <button id="go">입장하기</button>`;
+      <p>같은 방 이름으로 두 명이 들어오면 시작해요!</p>
+      <input id="nick" maxlength="12" placeholder="이름" value="${escapeHtml(store('nick') || '')}">
+      <input id="room" maxlength="20" placeholder="방 이름 (둘이 똑같이)" value="${escapeHtml(params.get('room') || store('room') || 'main')}">
+      <button id="go">온라인 입장</button>
+      <div><button id="solo" style="background:#8ecae6;font-size:16px;padding:10px 18px">한 기기에서 둘이 하기</button></div>`);
     document.getElementById('go').onclick = () => {
       const nick = document.getElementById('nick').value.trim();
       const room = document.getElementById('room').value.trim() || 'main';
-      try { localStorage.setItem('nick', nick); } catch (e) {}
-      connect(nick, room);
+      store('nick', nick); store('room', room);
+      if (inArtifact) connectRoom(nick, room); else connectWs(nick, room);
     };
+    document.getElementById('solo').onclick = startHotseat;
   }
   function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
   function showCard(html) { overlay.classList.remove('hidden'); card.innerHTML = html; }
   function hideCard() { overlay.classList.add('hidden'); }
+  const clone = m => JSON.parse(JSON.stringify(m));
+  // 실시간 방 메시지는 4KB 제한이 있어서 지형 높이를 글자 2개씩(36진수)으로 압축
+  function pack(m) {
+    if (!m.heights) return m;
+    const o = Object.assign({}, m);
+    o.hz = m.heights.map(h => Math.max(0, Math.min(1295, Math.round(h))).toString(36).padStart(2, '0')).join('');
+    delete o.heights;
+    return o;
+  }
+  function unpack(m) {
+    if (!m || typeof m.hz !== 'string') return m;
+    const h = [];
+    for (let i = 0; i + 1 < m.hz.length; i += 2) h.push(parseInt(m.hz.substr(i, 2), 36) || 0);
+    const o = Object.assign({}, m, { heights: h });
+    delete o.hz;
+    return o;
+  }
 
-  function connect(nick, room) {
+  function connectWs(nick, room) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${location.host}/?room=${encodeURIComponent(room)}&nick=${encodeURIComponent(nick)}`);
+    const ws = new WebSocket(`${proto}://${location.host}/?room=${encodeURIComponent(room)}&nick=${encodeURIComponent(nick)}`);
     showCard('<h1>접속 중...</h1><div class="spin"></div>');
+    net = { send: m => ws.readyState === 1 && ws.send(JSON.stringify(m)) };
     ws.onmessage = e => onMsg(JSON.parse(e.data));
     ws.onclose = () => {
       if (phase === 'full') return;
@@ -84,50 +113,138 @@
     };
   }
 
+  function startHotseat() {
+    hotseat = true;
+    localGame = new F.Game((slot, m) => { if (slot === 0) setTimeout(() => onMsg(clone(m)), 0); });
+    net = { send: m => localGame.handle(turn, clone(m)) };
+    localGame.start(['1P', '2P']);
+  }
+
+  async function connectRoom(nick, roomCode) {
+    showCard('<h1>접속 중...</h1><div class="spin"></div>');
+    const lobby = await window.claude.use('room');
+    if (!lobby) return roomFail('이 화면에서는 온라인 대전을 쓸 수 없어요.');
+    let r;
+    const slug = roomCode.toLowerCase().replace(/[^a-z0-9_-]/g, c => c.charCodeAt(0).toString(36)).slice(0, 40) || 'main';
+    try { r = await lobby.join('f-' + slug); } catch (e) { return roomFail('방에 들어가지 못했어요. (' + (e && e.code || '오류') + ')'); }
+
+    let myPeer = null, hostPeer = null, guestPeer = null, amHost = false, inGame = false, syncTimer = null, lastStartFrom = null;
+    nick = nick || '플레이어';
+
+    r.on('g', msg => {   // 방장 → 손님
+      const d = msg.data;
+      if (!myPeer) { const mine = r.peers().find(p => p.sameTab); if (mine) myPeer = mine.peer; }
+      if (!d || !myPeer || d.to !== myPeer || amHost) return;
+      if (hostPeer && msg.peer !== hostPeer) return;
+      if (d.m && d.m.t === 'start') { clearTimeout(syncTimer); lastStartFrom = msg.peer; }
+      onMsg(unpack(d.m));
+    }, e => roomFail('연결이 끊겼어요. (' + e.code + ')'));
+    r.on('c', msg => {   // 손님 → 방장
+      if (amHost && localGame && msg.peer === guestPeer) localGame.handle(1, msg.data);
+    });
+
+    const evaluate = peers => {
+      const me_ = peers.find(p => p.sameTab);
+      if (me_) myPeer = me_.peer;
+      if (!myPeer) return;
+      const players = peers.filter(p => p.kind === 'viewer' && p.presence && typeof p.presence.nick === 'string')
+        .slice().sort((a, b) => (a.presence.at - b.presence.at) || (a.peer < b.peer ? -1 : 1));
+      const pair = players.slice(0, 2);
+      if (pair.length < 2) {
+        if (inGame) { inGame = false; if (localGame) localGame.stop(); localGame = null; onMsg({ t: 'left' }); }
+        else if (phase !== 'waiting') onMsg({ t: 'waiting' });
+        hostPeer = guestPeer = null;
+        return;
+      }
+      if (!pair.some(p => p.peer === myPeer)) { onMsg({ t: 'full' }); return; }
+      const h = pair[0].peer, g = pair[1].peer;
+      if (h === hostPeer && g === guestPeer && inGame) return;   // 그대로
+      hostPeer = h; guestPeer = g; amHost = myPeer === h; inGame = true;
+      if (amHost) {
+        if (localGame) localGame.stop();
+        localGame = new F.Game((slot, m) => {
+          if (slot === 0) setTimeout(() => onMsg(clone(m)), 0);
+          else r.emit('g', { to: guestPeer, m: pack(m) }).catch(e => console.warn('emit failed', e && e.message));
+        });
+        net = { send: m => localGame && localGame.handle(0, clone(m)) };
+        localGame.start([String(pair[0].presence.nick).slice(0, 12), String(pair[1].presence.nick).slice(0, 12)]);
+      } else {
+        if (localGame) localGame.stop();
+        localGame = null;
+        net = { send: m => r.emit('c', m).catch(() => {}) };
+        if (lastStartFrom !== h) { tanks = null; heights = null; phase = 'start'; showCard('<h1>게임 준비 중...</h1><div class="spin"></div>'); }
+        clearTimeout(syncTimer);
+        const ask = () => { if (!tanks || phase === 'waiting') { net.send({ t: 'sync' }); syncTimer = setTimeout(ask, 2500); } };
+        syncTimer = setTimeout(ask, 2500);
+      }
+    };
+    r.onPeers(ch => evaluate(ch.peers), e => roomFail('연결이 끊겼어요. (' + e.code + ')'));
+    try { await r.presence({ nick: nick.slice(0, 12), at: Date.now() }); } catch (e) { return roomFail('방에 들어가지 못했어요.'); }
+    onMsg({ t: 'waiting' });
+    evaluate(r.peers());
+    // 손님 쪽에서 메시지를 놓쳤으면 차례가 바뀔 때 다시 맞춤
+    setInterval(() => { if (!amHost && inGame && phase === 'aiming' && performance.now() > turnEnd + 4000) net.send({ t: 'sync' }); }, 3000);
+  }
+
+  function roomFail(text) {
+    phase = 'lobby';
+    showCard(`<h1>앗!</h1><p>${escapeHtml(text)}</p><button onclick="location.reload()">다시 시도</button><div><button id="solo2" style="background:#8ecae6;font-size:16px;padding:10px 18px">한 기기에서 둘이 하기</button></div>`);
+    document.getElementById('solo2').onclick = startHotseat;
+  }
+
+  const youName = i => hotseat ? tanks[i].nick : (i === me ? '나' : '상대');
+
   function onMsg(m) {
+    if (!m || typeof m.t !== 'string') return;
     switch (m.t) {
       case 'waiting':
         phase = 'waiting';
-        showCard(`<h1>친구를 기다리는 중</h1><div class="spin"></div><p>다른 기기에서 이 주소로 들어오고<br>같은 방 이름으로 입장하세요.</p><p style="font-size:13px;word-break:break-all">${escapeHtml(location.origin)}</p>`);
+        showCard(`<h1>친구를 기다리는 중</h1><div class="spin"></div><p>다른 기기에서 이 페이지를 열고<br>같은 방 이름으로 입장하세요.</p>${inArtifact ? '' : `<p style="font-size:13px;word-break:break-all">${escapeHtml(location.origin)}</p>`}`);
         break;
       case 'full':
         phase = 'full';
         showCard('<h1>방이 꽉 찼어요</h1><p>다른 방 이름으로 들어와 주세요.</p><button onclick="location.reload()">돌아가기</button>');
         break;
       case 'left':
-        phase = 'waiting'; charging = false; anim = null;
+        phase = 'waiting'; charging = false; anim = null; tanks = null; heights = null;
         showCard('<h1>상대가 나갔어요</h1><div class="spin"></div><p>새 친구를 기다리는 중...</p>');
         break;
       case 'start':
-        me = m.you; heights = m.heights; tanks = m.tanks;
+        me = m.you; heights = m.heights; tanks = m.tanks; turn = -1; phase = 'start';
         myAngle = 45; lastPower = null; anim = null; booms = []; floats = []; bannerQ = []; banner = null;
-        tanks.forEach(t => { t.shownHp = t.hp; t.angle = 45; });
+        tanks.forEach(t => { t.shownHp = t.hp; t.angle = t.angle == null ? 45 : t.angle; });
         hideCard();
         cam.x = tanks[me].x - C.VIEW_W / 2;
         cam.y = Math.max(0, F.groundAt(heights, tanks[me].x) - viewH() * 0.32);
-        showBanner(`나는 ${tanks[me].name}!`, `공격력 ${tanks[me].atk} · 방어력 ${tanks[me].def}`, 2500);
+        if (hotseat) showBanner('한 기기에서 둘이!', `1P ${tanks[0].name} vs 2P ${tanks[1].name}`, 2200);
+        else showBanner(`나는 ${tanks[me].name}!`, `공격력 ${tanks[me].atk} · 방어력 ${tanks[me].def}`, 2500);
         updateGaugeLast();
         break;
       case 'turn':
+        if (!tanks) { net.send({ t: 'sync' }); return; }
         turn = m.turn; phase = 'aiming'; turnEnd = performance.now() + m.ms; enemyPower = 0;
-        showBanner(turn === me ? '내 차례!' : '상대 차례', turn === me ? '왼쪽을 위아래로 끌어 각도 조절' : '조심해요!', 1400);
+        if (m.hp) tanks.forEach((t, i) => { t.hp = m.hp[i]; });
+        if (hotseat) { me = turn; myAngle = Math.round(tanks[me].angle); lastPower = tanks[me].lastPower ?? null; updateGaugeLast(); setPower(0); }
+        if (hotseat) showBanner(`${tanks[turn].nick} 차례!`, '왼쪽을 위아래로 끌어 각도 조절', 1400);
+        else showBanner(turn === me ? '내 차례!' : '상대 차례', turn === me ? '왼쪽을 위아래로 끌어 각도 조절' : '조심해요!', 1400);
         break;
       case 'aim':
-        if (tanks) { tanks[m.who].angle = m.angle; enemyPower = m.power; }
+        if (tanks && tanks[m.who]) { tanks[m.who].angle = Math.max(0, Math.min(90, Number(m.angle) || 0)); enemyPower = Number(m.power) || 0; }
         break;
       case 'timeout':
         if (m.turn === me) { charging = false; setPower(0); }
         showBanner('시간 초과!', '', 1100);
         break;
       case 'shot':
-        startShot(m);
+        if (tanks) startShot(m);
         break;
       case 'over':
         phase = 'over';
         setTimeout(() => {
-          const msg = m.winner === -1 ? '무승부!' : (m.winner === me ? '🎉 승리! 🎉' : '😢 패배...');
-          showCard(`<h1>${msg}</h1><p>${m.winner === -1 ? '둘 다 쓰러졌어요' : escapeHtml(tanks[m.winner].nick) + ' 승리!'}</p><button id="again">다시 하기</button>`);
-          document.getElementById('again').onclick = () => { ws.send(JSON.stringify({ t: 'restart' })); showCard('<h1>새 게임 준비 중...</h1><div class="spin"></div>'); };
+          const win = m.winner;
+          const msg = win === -1 ? '무승부!' : hotseat ? `🎉 ${escapeHtml(tanks[win].nick)} 승리! 🎉` : (win === me ? '🎉 승리! 🎉' : '😢 패배...');
+          showCard(`<h1>${msg}</h1><p>${win === -1 ? '둘 다 쓰러졌어요' : escapeHtml(tanks[win].nick) + ' · ' + escapeHtml(tanks[win].name)}</p><button id="again">다시 하기</button>`);
+          document.getElementById('again').onclick = () => { net.send({ t: 'restart' }); showCard('<h1>새 게임 준비 중...</h1><div class="spin"></div>'); };
         }, 600);
         break;
     }
@@ -149,6 +266,7 @@
     const shooter = tanks[m.shooter];
     shooter.angle = m.angle;
     if (m.shooter === me) { lastPower = m.power; updateGaugeLast(); }
+    shooter.lastPower = m.power;
     const sim = F.simulate(heights, shooter.x, shooter.dir, m.angle, m.power, tanks.map(t => t.x), m.shooter);
     anim = { pts: sim.pts, start: performance.now(), hit: m.hit, damages: m.damages, hp: m.hp, newHeights: m.heights, done: false, shooter: m.shooter };
   }
@@ -182,7 +300,7 @@
     gaugeLast.style.left = lastPower == null ? '-10px' : `calc(${lastPower}% - 1px)`;
   }
 
-  const canFire = () => phase === 'aiming' && turn === me && !anim;
+  const canFire = () => !!tanks && phase === 'aiming' && turn === me && !anim;
 
   fireBtn.addEventListener('pointerdown', e => {
     e.preventDefault();
@@ -195,7 +313,7 @@
     fireBtn.classList.remove('pressed');
     if (!charging) return;
     charging = false;
-    if (canFire()) ws.send(JSON.stringify({ t: 'fire', angle: myAngle, power: Math.round(power * 10) / 10 }));
+    if (canFire()) net.send({ t: 'fire', angle: myAngle, power: Math.round(power * 10) / 10 });
   };
   fireBtn.addEventListener('pointerup', release);
   fireBtn.addEventListener('pointercancel', release);
@@ -226,11 +344,11 @@
   cv.addEventListener('pointercancel', endDrag);
 
   function sendAim(force) {
-    if (!canFire() || !ws) return;
+    if (!canFire()) return;
     const now = performance.now();
     if (!force && now - lastAimSent < 70) return;
     lastAimSent = now;
-    ws.send(JSON.stringify({ t: 'aim', angle: myAngle, power: charging ? power : 0 }));
+    net.send({ t: 'aim', angle: myAngle, power: charging ? power : 0 });
   }
 
   // 키보드(컴퓨터용): ↑↓ 각도, 스페이스 발사
@@ -394,13 +512,13 @@
     ctx.font = `700 ${Math.round(12 * S * 0.9)}px system-ui`;
     ctx.textAlign = 'center';
     ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 3;
-    const label = (i === me ? '나 · ' : '') + t.nick;
+    const label = (i === me && !hotseat ? '나 · ' : '') + t.nick;
     ctx.strokeText(label, x, by - 8); ctx.fillText(label, x, by - 8);
     const bw = 50 * s;
     ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(x - bw / 2, by, bw, 7 * s);
     ctx.fillStyle = hpColor(t.shownHp); ctx.fillRect(x - bw / 2, by, bw * t.shownHp / 100, 7 * s);
     // 상대가 힘 모으는 중
-    if (i !== me && turn === i && phase === 'aiming' && enemyPower > 0) {
+    if (!hotseat && i !== me && turn === i && phase === 'aiming' && enemyPower > 0) {
       ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(x - bw / 2, by + 10 * s, bw, 5 * s);
       ctx.fillStyle = '#ffeb3b'; ctx.fillRect(x - bw / 2, by + 10 * s, bw * enemyPower / 100, 5 * s);
     }
@@ -466,14 +584,14 @@
     const half = (W - 30) / 2;
     tanks.forEach((t, i) => {
       // 왼쪽 칸 = 나, 오른쪽 칸 = 상대
-      const slot = i === me ? 0 : 1;
+      const slot = hotseat ? i : (i === me ? 0 : 1);
       const x = 10 + slot * (half + 10);
       ctx.fillStyle = turn === i && phase === 'aiming' ? 'rgba(255,235,59,.25)' : 'rgba(0,0,0,.35)';
       roundRect(x, top, half, 44, 8); ctx.fill();
       ctx.fillStyle = t.color; ctx.beginPath(); ctx.arc(x + 12, top + 13, 6, 0, 7); ctx.fill();
       ctx.textAlign = 'left'; ctx.fillStyle = '#fff';
       ctx.font = '700 12px system-ui';
-      ctx.fillText(`${i === me ? '나' : '상대'} · ${t.name}`, x + 22, top + 17);
+      ctx.fillText(`${youName(i)} · ${t.name}`, x + 22, top + 17);
       ctx.font = '600 10px system-ui'; ctx.fillStyle = '#ddd';
       ctx.fillText(`공 ${t.atk}  방 ${t.def}`, x + 8, top + 38);
       const bx = x + 64, bw = half - 72;
@@ -490,7 +608,7 @@
       ctx.fillStyle = warn ? `rgba(229,57,53,${0.7 + 0.3 * Math.sin(now / 120)})` : 'rgba(0,0,0,.45)';
       roundRect(W / 2 - 60, ty, 120, 34, 17); ctx.fill();
       ctx.fillStyle = '#fff'; ctx.font = '800 18px system-ui'; ctx.textAlign = 'center';
-      ctx.fillText(`${turn === me ? '내 차례' : '상대'} ${Math.ceil(left)}초`, W / 2, ty + 24);
+      ctx.fillText(`${hotseat ? tanks[turn].nick : (turn === me ? '내 차례' : '상대')} ${Math.ceil(left)}초`, W / 2, ty + 24);
       ctx.fillStyle = warn ? '#ffeb3b' : '#4fc3f7';
       ctx.fillRect(W / 2 - 50, ty + 30, 100 * left / C.TURN_SEC, 3);
     }

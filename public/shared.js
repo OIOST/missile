@@ -113,5 +113,94 @@
     return Math.max(1, Math.round(atk * fall * (1 - def / 60)));
   }
 
-  root.Fortress = { C, TANK_TYPES, rollTank, makeTerrain, groundAt, tankCenter, simulate, deform, damageFor };
+
+  // 한 판의 진행(턴/타이머/피해). send(slot, msg) 로 각 플레이어에게 메시지를 보냄.
+  // Node 서버와 브라우저(방장 기기) 양쪽에서 같은 코드로 돌아감.
+  class Game {
+    constructor(send) { this.send = send; this.phase = 'waiting'; this.timer = null; this.flyTimer = null; }
+    bcast(m) { this.send(0, m); this.send(1, m); }
+    stop() { clearTimeout(this.timer); clearTimeout(this.flyTimer); this.timer = this.flyTimer = null; this.phase = 'waiting'; }
+    start(nicks) {
+      this.stop();
+      this.heights = makeTerrain();
+      const t0 = rollTank(-1), t1 = rollTank(t0.type);
+      this.tanks = [
+        Object.assign({}, t0, { x: C.START_X[0], hp: 100, dir: 1, angle: 45, nick: nicks[0] || '플레이어1' }),
+        Object.assign({}, t1, { x: C.START_X[1], hp: 100, dir: -1, angle: 45, nick: nicks[1] || '플레이어2' }),
+      ];
+      this.turn = Math.random() < 0.5 ? 0 : 1;
+      for (let i = 0; i < 2; i++) this.send(i, this.startMsg(i));
+      this.beginTurn();
+    }
+    startMsg(i) { return { t: 'start', you: i, heights: this.heights, tanks: this.tanks }; }
+    turnMsg() {
+      return { t: 'turn', turn: this.turn, ms: Math.max(0, this.turnEndsAt - Date.now()), hp: this.tanks.map(t => t.hp) };
+    }
+    beginTurn() {
+      this.phase = 'aiming';
+      this.turnEndsAt = Date.now() + C.TURN_SEC * 1000;
+      this.bcast(this.turnMsg());
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => {
+        if (this.phase !== 'aiming') return;
+        this.bcast({ t: 'timeout', turn: this.turn });
+        this.turn = 1 - this.turn;
+        this.beginTurn();
+      }, C.TURN_SEC * 1000 + 300);
+    }
+    // 다시 접속하거나 메시지를 놓친 사람에게 현재 상황 전체를 다시 보냄
+    resync(i) {
+      if (!this.tanks || this.phase === 'waiting') return;
+      this.send(i, this.startMsg(i));
+      if (this.phase === 'aiming') this.send(i, this.turnMsg());
+    }
+    handle(idx, m) {
+      if (!m || typeof m !== 'object') return;
+      if (m.t === 'aim' && this.phase === 'aiming' && this.turn === idx) {
+        this.tanks[idx].angle = Math.max(0, Math.min(90, Number(m.angle) || 0));
+        this.send(1 - idx, { t: 'aim', who: idx, angle: this.tanks[idx].angle, power: Number(m.power) || 0 });
+      } else if (m.t === 'fire') {
+        this.fire(idx, m.angle, m.power);
+      } else if (m.t === 'restart' && this.phase === 'over') {
+        this.start(this.tanks.map(t => t.nick));
+      } else if (m.t === 'sync') {
+        this.resync(idx);
+      }
+    }
+    fire(idx, angle, power) {
+      if (this.phase !== 'aiming' || this.turn !== idx) return;
+      clearTimeout(this.timer);
+      this.phase = 'flying';
+      angle = Math.max(0, Math.min(90, Number(angle) || 0));
+      power = Math.max(0, Math.min(100, Number(power) || 0));
+      const me = this.tanks[idx];
+      me.angle = angle;
+      const sim = simulate(this.heights, me.x, me.dir, angle, power, this.tanks.map(t => t.x), idx);
+      const hit = sim.hit;
+      const damages = [0, 0];
+      if (hit.type !== 'out') {
+        this.tanks.forEach((t, i) => {
+          const c = tankCenter(this.heights, t.x);
+          const d = damageFor(me.atk, t.def, Math.hypot(c.x - hit.x, c.y - hit.y), hit.type === 'tank' && hit.tank === i);
+          damages[i] = d;
+          t.hp = Math.max(0, t.hp - d);
+        });
+      }
+      if (hit.type !== 'out') deform(this.heights, hit.x, hit.y, C.CRATER_R);
+      this.bcast({ t: 'shot', shooter: idx, angle, power, hit, damages, hp: this.tanks.map(t => t.hp), heights: this.heights });
+      const flyMs = sim.pts.length * C.DT * 1000 + 1800;
+      this.flyTimer = setTimeout(() => {
+        const dead = this.tanks.map(t => t.hp <= 0);
+        if (dead[0] || dead[1]) {
+          this.phase = 'over';
+          this.bcast({ t: 'over', winner: dead[0] && dead[1] ? -1 : (dead[0] ? 1 : 0) });
+          return;
+        }
+        this.turn = 1 - this.turn;
+        this.beginTurn();
+      }, flyMs);
+    }
+  }
+
+  root.Fortress = { C, TANK_TYPES, rollTank, makeTerrain, groundAt, tankCenter, simulate, deform, damageFor, Game };
 })(typeof module !== 'undefined' ? module.exports : window);
