@@ -862,7 +862,12 @@
   }
 
   function drawProtractor() {
-    const t = tanks[me];
+    // 화면에 보이는(지금 차례인) 탱크 기준으로 그림 → 탱크가 바라보는 방향과 항상 같음
+    const fi = turn >= 0 && phase !== 'start' ? turn : me;
+    const mine = fi === me;
+    const t = tanks[fi];
+    const ang = mine ? myAngle : Math.round(t.angle);
+    const needle = mine ? '#ffeb3b' : '#ff7043';
     const R = Math.min(95, W * 0.24);
     const dir = t.dir;
     const cx = dir > 0 ? 20 : 20 + R, cy = H - 40;
@@ -883,17 +888,17 @@
       if (d % 30 === 0) ctx.fillText(d, cx + ux * (R - 20), cy + uy * (R - 20) + 3);
     }
     // 지난 각도(흐리게) 대신 현재 바늘
-    const a = myAngle * Math.PI / 180;
-    ctx.strokeStyle = '#ffeb3b'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    const a = ang * Math.PI / 180;
+    ctx.strokeStyle = needle; ctx.lineWidth = 4; ctx.lineCap = 'round';
     ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * dir * (R - 4), cy - Math.sin(a) * (R - 4)); ctx.stroke();
-    ctx.fillStyle = '#ffeb3b'; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 7); ctx.fill();
+    ctx.fillStyle = needle; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 7); ctx.fill();
     // 숫자
     ctx.font = '900 26px system-ui'; ctx.textAlign = 'center';
     ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.6)';
     const tx = dir > 0 ? cx + R * 0.55 : cx - R * 0.55;
-    ctx.strokeText(`${myAngle}°`, tx, cy + 30); ctx.fillStyle = '#fff'; ctx.fillText(`${myAngle}°`, tx, cy + 30);
+    ctx.strokeText(`${ang}°`, tx, cy + 30); ctx.fillStyle = '#fff'; ctx.fillText(`${ang}°`, tx, cy + 30);
     ctx.font = '600 11px system-ui'; ctx.fillStyle = 'rgba(255,255,255,.85)';
-    ctx.fillText('↕ 끌어서 각도', dir > 0 ? cx + R * 0.5 : cx - R * 0.5, cy - R - 10);
+    ctx.fillText(mine || hotseat ? '↕ 끌어서 각도' : '상대 각도', dir > 0 ? cx + R * 0.5 : cx - R * 0.5, cy - R - 10);
     ctx.restore();
   }
 
